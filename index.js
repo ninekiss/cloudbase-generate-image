@@ -674,7 +674,7 @@ async function mcpDispatch(method, params) {
       return {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "generateImage-mcp", version: "2.1.1" },
+        serverInfo: { name: "generateImage-mcp", version: "2.2.0" },
       }
     case "tools/list":
       return { tools: MCP_TOOLS }
