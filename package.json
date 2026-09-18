@@ -1,8 +1,14 @@
 {
   "name": "generateImage",
-  "version": "2.1.1",
-  "description": "CloudBase AI 文生图/图生图云函数（默认 3.0 模型 + fail-closed API Key 鉴权 + MCP Server + provider 修正 + 动态 prompt 上限 + HTTP 状态码统一透传 + footnote 水印 + 参考图自动压缩 + MCP 协议层方法放行/标准 JSON-RPC 错误码）",
+  "version": "2.2.0",
+  "description": "CloudBase AI 文生图/图生图云函数（默认 3.0 模型 + fail-closed API Key 鉴权 + MCP Server + provider 修正 + 动态 prompt 上限 + HTTP 状态码统一透传 + footnote 水印 + 参考图自动压缩 + MCP 协议层方法放行/标准 JSON-RPC 错误码 + 精简滑动窗口限流）",
   "main": "index.js",
+  "scripts": {
+    "test": "node test/index.test.js && node test/rate-limit.test.js",
+    "test:index": "node test/index.test.js",
+    "test:rate": "node test/rate-limit.test.js",
+    "check": "node --check index.js && node --check selfhosted/server.js"
+  },
   "dependencies": {
     "@cloudbase/node-sdk": "^3.18.3",
     "sharp": "^0.33.5"

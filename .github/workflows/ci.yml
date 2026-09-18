@@ -38,6 +38,32 @@ jobs:
           node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('root package.json OK')"
           node -e "JSON.parse(require('fs').readFileSync('selfhosted/package.json','utf8')); console.log('selfhosted/package.json OK')"
 
+  unit-test:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18.15', '20', '22']
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # 单测自带 SDK 替身，不需要 npm install。
+      - name: 云函数版单测（鉴权 / MCP 协议 / 状态码 / 水印）
+        run: node test/index.test.js
+
+      - name: 限流单测（滑动窗口 / 两层配额 / 协议层豁免）
+        run: node test/rate-limit.test.js
+
+      - name: 自建版单测（鉴权 / 限流 / 状态码映射）
+        run: node selfhosted/test/server.test.js
+
   secret-scan:
     name: 敏感信息扫描
     runs-on: ubuntu-latest

@@ -22,9 +22,19 @@ const cloudbase = require("@cloudbase/node-sdk")
  *               工具: generate_image
  *
  * HTTP 状态码约定 (v2.0.0 起统一透传):
- *   200 成功 | 400 参数错误 | 401 鉴权失败 | 422 参数语义不可用 | 500 服务端异常
+ *   200 成功 | 400 参数错误 | 401 鉴权失败 | 422 参数语义不可用
+ *   429 请求过于频繁 | 500 服务端异常
  *   ★ 注意: 必须返回 {statusCode, headers, body} 网关才透传状态码;
  *     返回普通对象时网关一律回 200 (曾经参数错误也回 200, 调用方会误判成功)。
+ *
+ * 频率限制 (v2.2.0, 防 key 泄露被刷爆):
+ *   只对"消耗混元额度"的调用计数 —— 普通 HTTP 生成 与 MCP `tools/call`。
+ *   协议层方法(initialize/ping/notifications/*)不计数, 避免握手就把配额吃光。
+ *   两层滑动窗口: 分钟级(防突发) + 小时级(防持续薅), 默认 10/min 与 120/h。
+ *   可用环境变量 RATE_LIMIT_PER_MIN / RATE_LIMIT_PER_HOUR 调节, 设 0 表示关该层。
+ *   命中时: 普通 HTTP 回 429 + Retry-After; MCP 回 JSON-RPC -32029(带 retryAfter)。
+ *   ⚠️ 已知局限: 内存态, 云函数多实例并发时实际阈值 ≈ 阈值 × 实例数。
+ *      需要严格全局限流时应换 Redis/云数据库(记账已隔离在 rateCheck 里)。
  *
  * 鉴权 (v1.8.0, fail-closed):
  *  HTTP 访问必须携带与环境变量 API_KEY **完全一致**的 key, 否则拒绝。
@@ -202,15 +212,34 @@ function unauthorizedResponse(msg) {
   )
 }
 
+// 429: 限流命中。带 Retry-After 让规范客户端自动退避。
+function rateLimitedResponse(info) {
+  const scopeText = info.scope === "minute" ? "每分钟" : "每小时"
+  return jsonResponse(
+    429,
+    {
+      success: false,
+      code: "rate_limited",
+      message: `请求过于频繁：${scopeText}最多 ${info.limit} 次，请 ${info.retryAfter} 秒后重试。`,
+      scope: info.scope,
+      limit: info.limit,
+      retryAfter: info.retryAfter,
+    },
+    { "Retry-After": String(info.retryAfter) }
+  )
+}
+
 // 业务错误码 -> HTTP 状态码映射
 //   400 调用方参数问题(可自行修复)
 //   401 鉴权失败
 //   422 参数语法正确但语义不可用(如参考图 URL 下不动、URL 传进了 images 字段)
+//   429 请求过于频繁(带 Retry-After, 调用方应退避重试)
 //   500 服务端/上游异常(调用方重试可能有用)
 const ERROR_HTTP_STATUS = {
   invalid_param: 400,
   url_in_images_field: 422,
   download_failed: 422,
+  rate_limited: 429,
   server_misconfigured: 500,
 }
 
@@ -224,6 +253,86 @@ function httpify(result) {
     result && typeof result === "object" && result.success === false && typeof result.code === "string"
   if (!isBusinessError) return result
   return jsonResponse(ERROR_HTTP_STATUS[result.code] || 400, result)
+}
+// ==== 频率限制 ==========================================================
+// 目标: 拦住"key 泄露后被刷爆"和"客户端循环重试打爆混元额度"。
+// 为什么必须有: API Key 是一串长期不变的静态密钥, 一旦泄露就是无限额度;
+//   而每次 tools/call 都真实消耗混元计费, 成本直接量化。
+//
+// 设计取舍:
+//  - ★ 只对"会消耗后端额度"的调用计数, 即普通 HTTP 生成 + MCP tools/call。
+//    协议层方法(initialize/ping/notifications/*)不计数 —— 与 checkAuth 共用
+//    isProtocolMethod() 判据, 避免"握手也吃配额"导致客户端连不上。
+//  - ★ 两层窗口: 分钟级(防突发) + 小时级(防持续薅)。只有分钟级会被瞬间打满,
+//    只有小时级会让"每分钟刚好不超"的慢速刷量漏过去, 两者互补。
+//  - ★ 内存滑动窗口, 不引入 Redis: 单实例云函数足够, 且零额外依赖/成本。
+//    ⚠️ 已知局限: 云函数多实例并发时, 每个实例各算一份, 实际阈值 ≈ 阈值 × 实例数。
+//       若日后需要严格全局限流, 再换 Redis/云数据库计数(接口已隔离在下方函数里)。
+//  - ★ 限流命中返回 429, 并带 Retry-After, 让规范的客户端知道该退避。
+//  - 可用环境变量调节: RATE_LIMIT_PER_MIN(默认 10) / RATE_LIMIT_PER_HOUR(默认 120)。
+//    任一设为 0 表示关闭该层(便于本地调试)。
+const RATE_LIMIT_PER_MIN = toNonNegInt(process.env.RATE_LIMIT_PER_MIN, 10)
+const RATE_LIMIT_PER_HOUR = toNonNegInt(process.env.RATE_LIMIT_PER_HOUR, 120)
+
+function toNonNegInt(v, dflt) {
+  if (v === undefined || v === null || String(v).trim() === "") return dflt
+  const n = Number(v)
+  if (!Number.isFinite(n) || n < 0) return dflt
+  return Math.floor(n)
+}
+
+// ★ 单实例内存态。key -> 时间戳数组(ms, 升序)。
+//   读取时刻惰性清理: 只保留最近 1 小时内的记录, 避免长期运行内存无限增长。
+const _rateBuckets = new Map()
+const RATE_WINDOW_MAX = 3600 * 1000
+
+function rateCheck(bucketKey, now) {
+  const cutoff = now - RATE_WINDOW_MAX
+  let arr = _rateBuckets.get(bucketKey)
+  if (!arr) { arr = []; _rateBuckets.set(bucketKey, arr) }
+  // 惰性清理: 丢掉窗口外的旧记录
+  let drop = 0
+  while (drop < arr.length && arr[drop] <= cutoff) drop++
+  if (drop > 0) arr.splice(0, drop)
+
+  // 分别统计两个窗口内的次数
+  const minCutoff = now - 60 * 1000
+  let inMin = 0
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i] > minCutoff) inMin++
+    else break
+  }
+  const inHour = arr.length
+
+  if (RATE_LIMIT_PER_MIN > 0 && inMin >= RATE_LIMIT_PER_MIN) {
+    // 最早一次在窗口内的记录 + 60s = 可重试时刻
+    const oldestInMin = arr[arr.length - inMin]
+    return {
+      limited: true,
+      scope: "minute",
+      limit: RATE_LIMIT_PER_MIN,
+      retryAfter: Math.max(1, Math.ceil((oldestInMin + 60 * 1000 - now) / 1000)),
+    }
+  }
+  if (RATE_LIMIT_PER_HOUR > 0 && inHour >= RATE_LIMIT_PER_HOUR) {
+    const oldestInHour = arr[arr.length - inHour]
+    return {
+      limited: true,
+      scope: "hour",
+      limit: RATE_LIMIT_PER_HOUR,
+      retryAfter: Math.max(1, Math.ceil((oldestInHour + RATE_WINDOW_MAX - now) / 1000)),
+    }
+  }
+  // 通过: 记账
+  arr.push(now)
+  return { limited: false, used: { minute: inMin + 1, hour: inHour + 1 } }
+}
+
+// 限流键: 用 API Key 指纹(而非明文), 避免在内存/日志里留下可用凭证。
+//   同一 key 共享配额; 未携带 key 的情况已被鉴权层拦掉, 这里兜底用 "anon"。
+function rateKeyFromKey(apiKey) {
+  const crypto = require("crypto")
+  return crypto.createHash("sha256").update(String(apiKey || "anon")).digest("hex").slice(0, 16)
 }
 // ======================================================================
 
@@ -625,6 +734,28 @@ exports.main = async (event, context) => {
       return { jsonrpc: "2.0", id: rpc.id != null ? rpc.id : null,
         error: { code: -32001, message: deny.message } }
     }
+
+    // ★ 限流: 只对会消耗混元额度的 tools/call 计数。
+    //   协议层方法(initialize/ping/notifications/*)不计数 —— 与 checkAuth 共用
+    //   isProtocolMethod() 判据; 否则客户端握手/探活就把配额吃光, 正常调用被误伤。
+    if (!isProtocolMethod(rpc.method)) {
+      const n = rateCheck(rateKeyFromKey(API_KEY), Date.now())
+      if (n.limited) {
+        // MCP 通道按 JSON-RPC 报错。★ 用 -32029 (MCP 约定的 rate limit 错误码族),
+        // 而不是 -32001(鉴权) —— 报成鉴权错误会让客户端去折腾凭证, 排查方向被带偏。
+        // data 里带 retryAfter, 客户端可据此退避。
+        return {
+          jsonrpc: "2.0",
+          id: rpc.id != null ? rpc.id : null,
+          error: {
+            code: -32029,
+            message: `请求过于频繁：${n.scope === "minute" ? "每分钟" : "每小时"}最多 ${n.limit} 次，请 ${n.retryAfter} 秒后重试。`,
+            data: { scope: n.scope, limit: n.limit, retryAfter: n.retryAfter },
+          },
+        }
+      }
+    }
+
     const result = await mcpDispatch(rpc.method, rpc.params || {})
     // 通知没有响应体 (MCP 规范): 回空 result, 不构造内容。
     // 注意: MCP 通道的返回体是纯 JSON-RPC (客户端按 JSON-RPC 解析),
@@ -642,6 +773,10 @@ exports.main = async (event, context) => {
   // 普通 HTTP —— 先过鉴权 (isMcpContent=false: method 传 null 不影响判定)
   const deny = checkAuth(event, query, body, null, false)
   if (deny) return unauthorizedResponse(deny.message)
+
+  // 普通 HTTP 全部是生成请求, 一律计数。
+  const rl = rateCheck(rateKeyFromKey(API_KEY), Date.now())
+  if (rl.limited) return rateLimitedResponse(rl)
 
   // ★ 业务错误也要透传 HTTP 状态码, 否则调用方看到 200 会误判成功 (见 httpify)
   return httpify(await doGenerate(input))

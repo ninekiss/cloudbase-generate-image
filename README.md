@@ -24,7 +24,8 @@
 | seed 可复现 | ✅ | `seed` |
 | MCP 协议 | ✅ | `?mcp=1` 或 header `x-mcp:1` |
 | API Key 鉴权 | ✅ | fail-closed，环境变量 `API_KEY` + header `x-api-key` |
-| HTTP 状态码透传 | ✅ | 200 / 400 / 401 / 422 / 500 |
+| **频率限制** | ✅ | 滑动窗口 10/min + 120/h（可配），命中回 429 / JSON-RPC `-32029` |
+| HTTP 状态码透传 | ✅ | 200 / 400 / 401 / 422 / 429 / 500 |
 | Clarity 超分 / 多图 | ❌ | SDK 不支持，需直连腾讯云裸 API |
 
 ---
@@ -35,11 +36,14 @@
 .
 ├── index.js              # 云函数主逻辑（单文件，无外部框架依赖）
 ├── package.json          # 依赖：@cloudbase/node-sdk + sharp
+├── CONVENTIONS.md        # ★ 文档与密钥约定（改文档前先读）
 ├── docs/实测报告.md       # ★ 完整技术文档：能力 / 实测 / 踩坑 / 调用示例
+├── test/                 # 离线单测（自带 SDK 替身，无需 npm install）
 └── selfhosted/           # 可脱离云函数运行的自建版
     ├── server.js         #   零框架，仅用 Node 内置 http 模块
     ├── package.json
-    └── README.md         #   迁移说明：哪些要改、凭证怎么传、差异清单
+    ├── README.md         #   迁移说明：哪些要改、凭证怎么传、差异清单
+    └── test/
 ```
 
 ---
@@ -59,6 +63,8 @@
 |---|---|---|
 | `API_KEY` | ✅ | 对外鉴权 key。**fail-closed**：不配置则拒绝所有 HTTP 访问 |
 | `DEFAULT_MODEL` | ❌ | 覆盖默认文生图模型 |
+| `RATE_LIMIT_PER_MIN` | ❌ | 每分钟上限，默认 `10`；设 `0` 关闭该层 |
+| `RATE_LIMIT_PER_HOUR` | ❌ | 每小时上限，默认 `120`；设 `0` 关闭该层 |
 
 ### 2. 调用
 
@@ -133,20 +139,57 @@ node server.js
 | 任务 | 内容 |
 |---|---|
 | **语法与结构校验** | 在 Node `18.15` / `20` / `22` 三档下跑 `node --check` 校验 `index.js` 与 `selfhosted/server.js`；并校验两个 `package.json` 可被 `JSON.parse` |
+| **单元测试** | 同样三档 Node 下跑全部 3 个测试文件（共 98 项断言） |
 | **敏感信息扫描** | 拦截硬编码密钥（`AKID...`、`sk-...`、`gh*_...`、`*secretKey = "..."`）与真实环境标识（`pc-<envId>`、`lam-<functionId>`、真实 appid） |
 
 设计取舍：
 
-- **刻意不做 `npm install`** —— 本仓库依赖 `sharp`（含原生绑定）和 `@cloudbase/node-sdk`，在 CI 装它意义不大（真正的运行环境是云函数层挂载的 `sharp`），且会拖慢流水线。语法校验已足以拦住绝大多数低级错误。
+- **刻意不做 `npm install`** —— 本仓库依赖 `sharp`（含原生绑定）和 `@cloudbase/node-sdk`，在 CI 装它意义不大（真正的运行环境是云函数层挂载的 `sharp`），且会拖慢流水线。单测自带 SDK 替身，所以照样能跑。
 - **敏感信息扫描是防回归的**，不是替代人工审计 —— 仓库是公开的，任何一次 `git push` 前都会被这道门拦住。
 - 三个 Node 版本覆盖了「云函数运行时 18.15」到「最新 LTS」，跨版本语法差异（如较新的内置 API）能被提前发现。
 
 本地想跑同样的检查：
 
 ```bash
-node --check index.js
-node --check selfhosted/server.js
+npm run check   # 语法
+npm test        # 单测
 ```
+
+---
+
+## 频率限制
+
+API Key 是一串**长期不变**的静态密钥，一旦泄露就是无限额度；而每次生成都真实消耗混元计费。
+所以除鉴权外还做了一层限流：
+
+| 窗口 | 默认 | 作用 |
+|---|---|---|
+| 分钟 | 10 次 | 防突发刷量 |
+| 小时 | 120 次 | 防"每分钟刚好不超"的慢速持续薅 |
+
+- **只对消耗额度的调用计数** —— 普通 HTTP 生成与 MCP `tools/call`。
+  `initialize` / `ping` / `notifications/*` 等协议层方法**不计数**，否则客户端握手/探活就把配额吃光。
+- 命中时：普通 HTTP 回 **429 + `Retry-After`**；MCP 回 JSON-RPC **`-32029`**（不是 `-32001`，避免把排查方向带偏到凭证问题）。
+- 限流键是 API Key 的 SHA-256 指纹前 16 位，内存里不留明文。
+
+> ⚠️ **已知局限**：云函数版是**实例内存态**，多实例并发时实际阈值 ≈ 阈值 × 实例数。
+> 需要严格全局限流时，应把 `rateCheck()` 的记账换成 Redis 或云数据库计数。
+> 自建版（`selfhosted/`）是长驻进程，内存态即全局，限流是精确的。
+
+---
+
+## 测试
+
+单测是**离线**的 —— 自带 `@cloudbase/node-sdk` 替身，无需 `npm install`、无凭证、无网络：
+
+```bash
+npm test                              # 全部
+node test/index.test.js               # 云函数版：鉴权 / MCP 协议 / 状态码 / 水印 / size
+node test/rate-limit.test.js          # 限流：滑动窗口 / 两层配额 / 协议层豁免
+node selfhosted/test/server.test.js   # 自建版：鉴权 / 限流 / 状态码映射
+```
+
+限流测试通过劫持 `Date.now` 推进虚拟时间，**无需真的 sleep 60 秒**就能验证窗口滑动。
 
 ---
 

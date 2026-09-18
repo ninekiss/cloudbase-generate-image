@@ -199,4 +199,37 @@ https://hunyuan-image-result-tob-1258344703.cos.ap-guangzhou.myqcloud.com/text2i
 | `TENCENTCLOUD_SESSIONTOKEN` | 临时密钥必填 | 临时密钥的 token，**漏了会 401** |
 | `API_KEY` | ✅ | 对外鉴权 key（fail-closed：不配则拒绝所有请求） |
 | `DEFAULT_MODEL` | ❌ | 覆盖默认文生图模型 |
+| `RATE_LIMIT_PER_MIN` | ❌ | 每分钟上限，默认 `10`；设 `0` 关闭该层 |
+| `RATE_LIMIT_PER_HOUR` | ❌ | 每小时上限，默认 `120`；设 `0` 关闭该层 |
 | `PORT` | ❌ | 默认 3000 |
+
+---
+
+## 九、限流：自建版是**精确**的
+
+自建版实现了与云函数版**逻辑相同**的滑动窗口限流（10/min + 120/h，可配），但效果不同：
+
+| | 云函数版 | 自建版 |
+|---|---|---|
+| 记账位置 | **每个实例各一份内存** | 常驻进程，**内存即全局** |
+| 实际阈值 | ≈ 阈值 × 实例数 | **精确等于**设定值 |
+
+原因：云函数会自动扩缩容，每个实例是独立进程，`Map` 不共享；自建版只有一个进程，
+所以这里的限流是可信的。**如果要严格限流，自建版比云函数版更可靠。**
+
+- 只对消耗额度的方法计数（普通 HTTP 生成 + MCP `tools/call`），协议层方法不计数。
+- 命中：普通 HTTP → `429` + `Retry-After`；MCP → JSON-RPC `-32029`。
+- 限流键是 API Key 的 SHA-256 指纹前 16 位，内存不留明文。
+
+## 十、跑测试
+
+```bash
+cd selfhosted
+node test/server.test.js
+```
+
+**离线**运行（自带 SDK 替身，无需 `npm install`、无凭证、无网络），覆盖鉴权、
+协议层判定、滑动窗口限流、状态码映射，共 38 项断言。
+
+> `server.js` 顶部有 `if (require.main === module)` 守卫 —— 被 `require` 时不会监听端口，
+> 所以测试可以安全地 import 它。

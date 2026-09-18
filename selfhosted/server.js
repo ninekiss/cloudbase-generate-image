@@ -144,7 +144,61 @@ const ERROR_HTTP_STATUS = {
   invalid_param: 400,
   url_in_images_field: 422,
   download_failed: 422,
+  rate_limited: 429,
   server_misconfigured: 500,
+}
+
+// ====== 频率限制 (与云函数版逻辑一致) ======
+// 目标: 拦住"key 泄露被刷爆"与"客户端循环重试打爆混元额度"。
+// 自建版比云函数版更有必要: 这里是长驻进程, 内存态就是**全局**的,
+//   不像云函数多实例各算一份。所以自建版的限流是精确的。
+// 参数: RATE_LIMIT_PER_MIN(默认 10) / RATE_LIMIT_PER_HOUR(默认 120), 设 0 关该层。
+const RATE_LIMIT_PER_MIN = toNonNegInt(process.env.RATE_LIMIT_PER_MIN, 10)
+const RATE_LIMIT_PER_HOUR = toNonNegInt(process.env.RATE_LIMIT_PER_HOUR, 120)
+
+function toNonNegInt(v, dflt) {
+  if (v === undefined || v === null || String(v).trim() === "") return dflt
+  const n = Number(v)
+  if (!Number.isFinite(n) || n < 0) return dflt
+  return Math.floor(n)
+}
+
+const _rateBuckets = new Map()
+const RATE_WINDOW_MAX = 3600 * 1000
+
+function rateCheck(bucketKey, now) {
+  const cutoff = now - RATE_WINDOW_MAX
+  let arr = _rateBuckets.get(bucketKey)
+  if (!arr) { arr = []; _rateBuckets.set(bucketKey, arr) }
+  let drop = 0
+  while (drop < arr.length && arr[drop] <= cutoff) drop++
+  if (drop > 0) arr.splice(0, drop)
+
+  const minCutoff = now - 60 * 1000
+  let inMin = 0
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i] > minCutoff) inMin++
+    else break
+  }
+  const inHour = arr.length
+
+  if (RATE_LIMIT_PER_MIN > 0 && inMin >= RATE_LIMIT_PER_MIN) {
+    const oldestInMin = arr[arr.length - inMin]
+    return { limited: true, scope: "minute", limit: RATE_LIMIT_PER_MIN,
+      retryAfter: Math.max(1, Math.ceil((oldestInMin + 60 * 1000 - now) / 1000)) }
+  }
+  if (RATE_LIMIT_PER_HOUR > 0 && inHour >= RATE_LIMIT_PER_HOUR) {
+    const oldestInHour = arr[arr.length - inHour]
+    return { limited: true, scope: "hour", limit: RATE_LIMIT_PER_HOUR,
+      retryAfter: Math.max(1, Math.ceil((oldestInHour + RATE_WINDOW_MAX - now) / 1000)) }
+  }
+  arr.push(now)
+  return { limited: false }
+}
+
+// 限流键用 API Key 指纹, 避免内存里留明文凭证。
+function rateKeyFromKey(apiKey) {
+  return require("crypto").createHash("sha256").update(String(apiKey || "anon")).digest("hex").slice(0, 16)
 }
 
 // 云函数版是 httpify() 返回 {statusCode, body} 给网关;
@@ -481,6 +535,22 @@ const server = http.createServer(async (req, res) => {
           error: { code: -32001, message: deny.message },
         })
       }
+      // 限流: 只对消耗混元额度的 tools/call 计数, 协议层方法不计数
+      if (!isProtocolMethod(rpc.method)) {
+        const n = rateCheck(rateKeyFromKey(API_KEY), Date.now())
+        if (n.limited) {
+          // MCP 规范里 -32029 是限流错误码族; 报 -32001(鉴权)会把排查方向带偏。
+          return sendJson(res, 200, {
+            jsonrpc: "2.0",
+            id: rpc.id != null ? rpc.id : null,
+            error: {
+              code: -32029,
+              message: `请求过于频繁：${n.scope === "minute" ? "每分钟" : "每小时"}最多 ${n.limit} 次，请 ${n.retryAfter} 秒后重试。`,
+              data: { scope: n.scope, limit: n.limit, retryAfter: n.retryAfter },
+            },
+          })
+        }
+      }
       const result = await mcpDispatch(rpc.method, rpc.params || {})
       // 通知没有响应体: 按 Streamable HTTP 规范回 202 Accepted + 空 body
       if (result === MCP_NO_CONTENT) {
@@ -500,6 +570,16 @@ const server = http.createServer(async (req, res) => {
         { "WWW-Authenticate": 'Bearer realm="generateImage"' })
     }
 
+    // 普通 HTTP 全部是生成请求, 一律计数
+    const rl = rateCheck(rateKeyFromKey(API_KEY), Date.now())
+    if (rl.limited) {
+      return sendJson(res, 429, {
+        success: false, code: "rate_limited",
+        message: `请求过于频繁：${rl.scope === "minute" ? "每分钟" : "每小时"}最多 ${rl.limit} 次，请 ${rl.retryAfter} 秒后重试。`,
+        scope: rl.scope, limit: rl.limit, retryAfter: rl.retryAfter,
+      }, { "Retry-After": String(rl.retryAfter) })
+    }
+
     const input = { ...query, ...(parsed && typeof parsed === "object" ? parsed : {}) }
     const result = await doGenerate(input)
     return sendJson(res, resolveStatus(result), result)
@@ -512,12 +592,20 @@ const server = http.createServer(async (req, res) => {
 })
 
 const PORT = Number(process.env.PORT || 3000)
-server.listen(PORT, () => {
-  console.log(`generateImage (self-hosted) listening on :${PORT}`)
-  console.log(`  POST http://localhost:${PORT}/api/gen-image`)
-  console.log(`  POST http://localhost:${PORT}/api/gen-image?mcp=1   (MCP)`)
-  console.log(`  GET  http://localhost:${PORT}/healthz`)
-  if (!API_KEY) console.warn("⚠️  未配置 API_KEY, 所有请求都会被拒 (fail-closed)")
-})
+// ★ 仅在作为主模块直接运行时才监听。被 require（例如单测）时不占端口。
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`generateImage (self-hosted) listening on :${PORT}`)
+    console.log(`  POST http://localhost:${PORT}/api/gen-image`)
+    console.log(`  POST http://localhost:${PORT}/api/gen-image?mcp=1   (MCP)`)
+    console.log(`  GET  http://localhost:${PORT}/healthz`)
+    if (!API_KEY) console.warn("⚠️  未配置 API_KEY, 所有请求都会被拒 (fail-closed)")
+  })
+}
 
-module.exports = { server, doGenerate, checkAuth, resolveStatus }
+module.exports = {
+  server, doGenerate, checkAuth, resolveStatus,
+  // 供单测使用
+  rateCheck, rateKeyFromKey, isProtocolMethod, isNotificationMethod,
+  ERROR_HTTP_STATUS,
+}
