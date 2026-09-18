@@ -1,0 +1,25 @@
+# 依赖（含原生绑定的 sharp，体积大且平台相关，不入库）
+node_modules/
+package-lock.json
+yarn.lock
+
+# 云函数代码包产物
+*.zip
+_build/
+
+# 实测生成的图片（体积大、与代码无关）
+generated-images/
+
+# 密钥 / 凭证（切勿提交）
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

@@ -1,0 +1,14 @@
+{
+  "name": "generateImage-selfhosted",
+  "version": "2.1.0",
+  "private": true,
+  "description": "generateImage 的自建服务器版本（零框架依赖，可部署到任意 Node 环境）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@cloudbase/node-sdk": "^3.18.3",
+    "sharp": "^0.33.5"
+  }
+}
