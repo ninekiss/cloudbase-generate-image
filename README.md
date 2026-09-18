@@ -1,5 +1,8 @@
 # generateImage — 腾讯云开发（CloudBase）AI 生图云函数
 
+[![CI](https://github.com/ninekiss/cloudbase-generate-image/actions/workflows/ci.yml/badge.svg)](https://github.com/ninekiss/cloudbase-generate-image/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 一个可直接部署的 CloudBase 云函数，把**混元生图**封装成两种形态：
 
 1. **HTTP 接口** —— 文生图 / 图生图，带 API Key 鉴权与真实 HTTP 状态码
@@ -120,6 +123,30 @@ node server.js
 - Node.js 18+（云函数运行时 Nodejs18.15）
 - `@cloudbase/node-sdk` **>= 3.18.3**（2.x 没有 `ai()` 方法，会报 `app.ai is not a function`）
 - `sharp` ^0.33.5
+
+---
+
+## 持续集成
+
+仓库自带 GitHub Actions 工作流 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，在 push / PR 到 `main` 时自动执行：
+
+| 任务 | 内容 |
+|---|---|
+| **语法与结构校验** | 在 Node `18.15` / `20` / `22` 三档下跑 `node --check` 校验 `index.js` 与 `selfhosted/server.js`；并校验两个 `package.json` 可被 `JSON.parse` |
+| **敏感信息扫描** | 拦截硬编码密钥（`AKID...`、`sk-...`、`gh*_...`、`*secretKey = "..."`）与真实环境标识（`pc-<envId>`、`lam-<functionId>`、真实 appid） |
+
+设计取舍：
+
+- **刻意不做 `npm install`** —— 本仓库依赖 `sharp`（含原生绑定）和 `@cloudbase/node-sdk`，在 CI 装它意义不大（真正的运行环境是云函数层挂载的 `sharp`），且会拖慢流水线。语法校验已足以拦住绝大多数低级错误。
+- **敏感信息扫描是防回归的**，不是替代人工审计 —— 仓库是公开的，任何一次 `git push` 前都会被这道门拦住。
+- 三个 Node 版本覆盖了「云函数运行时 18.15」到「最新 LTS」，跨版本语法差异（如较新的内置 API）能被提前发现。
+
+本地想跑同样的检查：
+
+```bash
+node --check index.js
+node --check selfhosted/server.js
+```
 
 ---
 

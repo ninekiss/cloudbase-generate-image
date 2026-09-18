@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-check:
+    name: 语法与结构校验
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18.15', '20', '22']
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: 云函数入口语法校验 (index.js)
+        run: node --check index.js
+
+      - name: 自建服务入口语法校验 (selfhosted/server.js)
+        run: node --check selfhosted/server.js
+
+      - name: package.json 可解析性校验
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('root package.json OK')"
+          node -e "JSON.parse(require('fs').readFileSync('selfhosted/package.json','utf8')); console.log('selfhosted/package.json OK')"
+
+  secret-scan:
+    name: 敏感信息扫描
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 扫描硬编码密钥 / 真实环境标识
+        run: |
+          set +e
+          FAIL=0
+
+          # 1) 腾讯云密钥形态
+          if grep -rnE 'AKID[A-Za-z0-9]{13,}' --include='*.js' --include='*.json' --include='*.md' .; then
+            echo "::error::发现疑似腾讯云 SecretId (AKID...)"; FAIL=1
+          fi
+
+          # 2) 通用大模型 / 第三方 key 形态
+          if grep -rnE '(sk-[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{20,})' --include='*.js' --include='*.json' --include='*.md' .; then
+            echo "::error::发现疑似 API Key (sk- / gh*_)"; FAIL=1
+          fi
+
+          # 3) 密钥赋值（排除占位符）
+          MATCH=$(grep -rnE '(secretId|secretKey|sessionToken|accessKey|apiKey|API_KEY|CLOUDBASE_APIKEY)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']+' \
+            --include='*.js' --include='*.json' --include='*.md' . \
+            | grep -vEi 'xxx|your[-_]|YOUR_|example|placeholder|process\.env|<[^>]*>|示例|占位|\$\{')
+          if [ -n "$MATCH" ]; then
+            echo "$MATCH"
+            echo "::error::发现疑似硬编码密钥赋值"; FAIL=1
+          fi
+
+          # 4) 私钥块
+          if grep -rn 'BEGIN .*PRIVATE KEY' --include='*.js' --include='*.json' --include='*.md' .; then
+            echo "::error::发现私钥块"; FAIL=1
+          fi
+
+          # 5) 真实环境标识残留（envId / FunctionId / appid）
+          if grep -rnE '(pc-[a-z0-9]{14,}|lam-[a-z0-9]{6,}|1307816256)' \
+            --include='*.js' --include='*.json' --include='*.md' .; then
+            echo "::error::发现真实 envId / FunctionId / appid 残留"; FAIL=1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "敏感信息扫描未通过"
+            exit 1
+          fi
+          echo "敏感信息扫描通过：未发现密钥或真实环境标识"
